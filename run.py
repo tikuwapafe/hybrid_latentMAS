@@ -17,23 +17,23 @@ from data import (
     load_humanevalplus,
     load_medqa
 )
-from methods.baseline import BaselineMethod
-from methods.latent_mas import LatentMASMethod
+# from methods.baseline import BaselineMethod
+# from methods.latent_mas import LatentMASMethod
 from methods.latent_mas_hybird import LatentMASMethod as HybridLatentMASMethod
 from methods import default_agents as method_default_agents
-from methods.procrustes_latent_mas import ProcrustesLatentMASMethod
+# from methods.procrustes_latent_mas import ProcrustesLatentMASMethod
 from methods.text_mas import TextMASMethod
-from methods.text_mas_c2c import TextMASC2CMethod
+# from methods.text_mas_c2c import TextMASC2CMethod
 # from methods.Vision_latent_mas import VisionLatentMASMethod
 # from methods.Vision_latent_mas_EX import VisionLatentMASMethodEX
 # from methods.vision_latent_mas_proto import VisionLatentMASMethodPROTO
 # from methods.vision_latent_mas_codec import VisionLatentMASMethodCodec
 from methods.vision_latent_mas_codec_new import VisionLatentMASMethodCODECNew
-from methods.vision_latent_mas_codec_vllm import (
-    VisionLatentMASMethodCODECVLLM,
-    VLLMMultimodalWrapper,
-)
-from methods.vision_latent_mas_codec_sglang import VisionLatentMASMethodCODECSGLang
+# from methods.vision_latent_mas_codec_vllm import (
+#     VisionLatentMASMethodCODECVLLM,
+#     VLLMMultimodalWrapper,
+# )
+# from methods.vision_latent_mas_codec_sglang import VisionLatentMASMethodCODECSGLang
 from methods.vision_latent_mas_ocr import VisionLatentMASMethodOCR
 from models import ModelWrapper, _past_length
 from utils import auto_device, extract_answer_with_meta, extract_markdown_python_block, normalize_answer, run_with_timeout, set_seed
