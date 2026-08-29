@@ -8,7 +8,7 @@ import re
 
 
 def load_gsm8k(split: str = "test", cache_dir: Optional[str] = None) -> Iterable[Dict]:
-    ds = load_dataset("gsm8k", "main", split=split, cache_dir=cache_dir)
+    ds = load_dataset("openai/gsm8k", "main", split=split, cache_dir=cache_dir)
     for item in ds:
         question = item["question"].strip()
         solution = item["answer"]
