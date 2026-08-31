@@ -26,4 +26,5 @@ scripts/squash*
 # 追加
 checkpoints/
 run.py.bak
+runs/
 
