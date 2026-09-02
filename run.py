@@ -650,6 +650,15 @@ def main():
     # New codec_new-specific args (optional; the method has sane defaults even if these are unset)
     parser.add_argument("--vision_codec_path", type=str, default="", help="Checkpoint path for codec_new (if set, load/save).")
     parser.add_argument("--wormhole_codec_path", type=str, default="", help="Checkpoint path for llm_wormhole (produced by train_llm_wormhole.py).")
+    parser.add_argument(
+        "--wormhole_zero_injection",
+        action="store_true",
+        help=(
+            "llm_wormhole用のアブレーションベースライン。プロンプト構造(dummy文章枠含む)は"
+            "本番と同一のまま、送信側からの注入ベクトルをゼロにする。"
+            "wormholeによる情報伝達の寄与を切り分けて評価するために使う。"
+        ),
+    )
     parser.add_argument("--vision_codec_dim", type=int, default=256, help="Universal space dimension D for codec_new.")
     parser.add_argument("--vision_codec_tokens", type=int, default=16, help="Number of universal tokens K for codec_new (excluding extra tokens).")
     parser.add_argument("--vision_codec_img_tokens", type=int, default=256, help="Decoder query tokens for codec_new (K_img).")

@@ -282,8 +282,21 @@ class LLMWormhole2Agent:
         max_new_tokens = max_new_tokens if max_new_tokens is not None else int(getattr(self.args, "max_new_tokens", 512))
         sender_name, receiver_name = self.model_names[0], self.model_names[1]
 
-        U_ref = self._encode_sender(sender_name, question, latent_steps=latent_steps)
-        inj = self._decode_receiver(receiver_name, U_ref)
+        zero_injection = bool(getattr(self.args, "wormhole_zero_injection", False))
+        if zero_injection:
+            # --- アブレーション用ベースライン ---
+            # プロンプト構造 (dummy文章枠を含む) は本番と完全に同一のまま、
+            # 注入ベクトルだけをゼロにする。これにより「wormholeの注入内容」が
+            # 精度にどれだけ寄与しているかを、プロンプト構造の違いという
+            # 交絡要因なしに切り分けられる (単にreceiverモデル単体に素の質問を
+            # 投げる場合との比較よりも公平な比較になる)。
+            slot = self.slots[receiver_name]
+            H = _infer_hidden_size(self.wrappers[receiver_name])
+            inj = torch.zeros((1, slot.n_tokens, H), device=self.device, dtype=torch.float32)
+        else:
+            U_ref = self._encode_sender(sender_name, question, latent_steps=latent_steps)
+            inj = self._decode_receiver(receiver_name, U_ref)
+
         answer = self._generate_receiver_answer(receiver_name, question, inj, max_new_tokens=max_new_tokens)
 
         return {
@@ -291,6 +304,7 @@ class LLMWormhole2Agent:
             "receiver": receiver_name,
             "question": question,
             "answer": answer,
+            "zero_injection": zero_injection,
         }
 
     # ------------------------------------------------------------------
