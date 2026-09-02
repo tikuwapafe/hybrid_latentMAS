@@ -35,6 +35,7 @@ from methods.vision_latent_mas_codec_new import VisionLatentMASMethodCODECNew
 # )
 # from methods.vision_latent_mas_codec_sglang import VisionLatentMASMethodCODECSGLang
 from methods.vision_latent_mas_ocr import VisionLatentMASMethodOCR
+from infer_llm_wormhole import LLMWormhole2Agent
 from models import ModelWrapper, _past_length
 from utils import auto_device, extract_answer_with_meta, extract_markdown_python_block, normalize_answer, run_with_timeout, set_seed
 import time
@@ -381,6 +382,7 @@ def process_batch(
         "vision_latent_mas_codec_sglang",
         "vision_latent_mas_rot",
         "vision_latent_mas_ocr",
+        "llm_wormhole",
     }:
         raw_preds = method.run_batch(current_items)
         results = _wrap_codec_new_results(raw_preds, current_items, args.task)
@@ -490,6 +492,7 @@ def main():
             "vision_latent_mas_codec_sglang",
             "vision_latent_mas_rot",
             "vision_latent_mas_ocr",
+            "llm_wormhole",
         ],
         required=True,
         help="Which multi-agent method to run.",
@@ -646,6 +649,7 @@ def main():
 
     # New codec_new-specific args (optional; the method has sane defaults even if these are unset)
     parser.add_argument("--vision_codec_path", type=str, default="", help="Checkpoint path for codec_new (if set, load/save).")
+    parser.add_argument("--wormhole_codec_path", type=str, default="", help="Checkpoint path for llm_wormhole (produced by train_llm_wormhole.py).")
     parser.add_argument("--vision_codec_dim", type=int, default=256, help="Universal space dimension D for codec_new.")
     parser.add_argument("--vision_codec_tokens", type=int, default=16, help="Number of universal tokens K for codec_new (excluding extra tokens).")
     parser.add_argument("--vision_codec_img_tokens", type=int, default=256, help="Decoder query tokens for codec_new (K_img).")
@@ -756,6 +760,18 @@ def main():
         raise ValueError(
             "--model_name is required for vision_latent_mas_codec_new/vision_latent_mas_codec_vllm/vision_latent_mas_codec_sglang/vision_latent_mas_rot/vision_latent_mas_ocr (or use --agent_model_names)."
         )
+    if args.method == "llm_wormhole":
+        if not args.agent_model_names:
+            raise ValueError(
+                "--agent_model_names (2つ以上のモデル名をカンマ区切り) is required for llm_wormhole."
+            )
+        if len(_parse_model_list(args.agent_model_names)) < 2:
+            raise ValueError("llm_wormhole requires at least 2 models in --agent_model_names (sender, receiver).")
+        if not args.wormhole_codec_path:
+            raise ValueError(
+                "--wormhole_codec_path is required for llm_wormhole "
+                "(checkpoint produced by train_llm_wormhole.py)."
+            )
     model = None
     multi_models = None
     role_model_map = None
@@ -770,6 +786,7 @@ def main():
         "vision_latent_mas_codec_sglang",
         "vision_latent_mas_rot",
         "vision_latent_mas_ocr",
+        "llm_wormhole",
     } and args.agent_model_names:
         model_names = _parse_model_list(args.agent_model_names)
         if not model_names:
@@ -813,6 +830,7 @@ def main():
                 "vision_latent_mas_rot",
                 "vision_latent_mas_ocr",
                 "text_mas_c2c",
+                "llm_wormhole",
             } else args.use_vllm
             multi_models = [
                 wrapper_cls(name, torch.device(dev), use_vllm=use_vllm, args=args)
@@ -962,6 +980,13 @@ def main():
         # Keep consistency with other multi-agent methods.
         args.mode = getattr(args, "mode", None) or args.prompt
         method = VisionLatentMASMethodOCR(
+            args=args,
+            models=multi_models,
+        )
+    elif args.method == "llm_wormhole":
+        if not multi_models or len(multi_models) < 2:
+            raise ValueError("llm_wormhole requires at least 2 models via --agent_model_names.")
+        method = LLMWormhole2Agent(
             args=args,
             models=multi_models,
         )
