@@ -493,6 +493,73 @@ def _load_anchor_texts(path: str) -> List[str]:
     return obj if isinstance(obj, list) and len(obj) >= 4 else default
 
 
+def _derive_partial_ckpt_path(path: str) -> str:
+    root, ext = os.path.splitext(path)
+    if ext:
+        return f"{root}.partial{ext}"
+    return f"{path}.partial.pt"
+
+
+def _atomic_torch_save(obj: Dict[str, Any], path: str) -> None:
+    """保存中のプロセスクラッシュ等で壊れたckptができないよう、tmpに書いてからrenameする。"""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    torch.save(obj, tmp_path)
+    os.replace(tmp_path, path)
+
+
+def _identity_alignment(model_names: Sequence[str], codec_dim: int, ref_idx: int = 0) -> Dict[str, Any]:
+    """まだ全モデルの学習が終わっていない途中経過チェックポイント用に、
+    hub alignmentが未計算であることを示す恒等写像を入れておく
+    (VLM版 train_vision_latent_mas_codec_new.py の _identity_alignment と同じ発想)。
+    最終的な本保存では実際のridge alignmentで上書きされる。
+    """
+    names = list(model_names)
+    ridx = max(0, min(int(ref_idx), len(names) - 1)) if names else 0
+    ref_name = names[ridx] if names else ""
+    I = torch.eye(int(codec_dim), dtype=torch.float32)
+    z = torch.zeros(int(codec_dim), dtype=torch.float32)
+    out = {n: {"W": I.clone(), "b": z.clone()} for n in names}
+    in_map = {n: {"W": I.clone(), "b": z.clone()} for n in names}
+    return {"ref_idx": ridx, "ref_model_name": ref_name, "out": out, "in": in_map}
+
+
+def _build_checkpoint_dict(
+    *,
+    model_names: Sequence[str],
+    args: argparse.Namespace,
+    encoders: Dict[str, Dict[str, torch.Tensor]],
+    decoders: Dict[str, Dict[str, torch.Tensor]],
+    slot_by_name: Dict[str, "WormholeSlot"],
+    align: Dict[str, Any],
+    is_partial: bool,
+) -> Dict[str, Any]:
+    names = [n for n in model_names if n in encoders and n in decoders]
+    return {
+        "version": 1,
+        "models": names,
+        "ref_model_name": align.get("ref_model_name", names[0] if names else ""),
+        "config": {
+            "codec_dim": int(args.codec_dim),
+            "codec_tokens": int(args.codec_tokens),
+            "codec_slot_tokens": int(args.codec_slot_tokens),
+            "codec_heads": int(args.codec_heads),
+            "codec_layers": int(args.codec_layers),
+            "codec_dropout": float(args.codec_dropout),
+            "codec_gate_init_bias": float(args.codec_gate_init_bias),
+        },
+        "encoders": {n: encoders[n] for n in names},
+        "decoders": {n: decoders[n] for n in names},
+        "align": align,
+        "placeholder": {
+            n: {"token_id": slot_by_name[n].token_id, "n_tokens": slot_by_name[n].n_tokens}
+            for n in names
+            if n in slot_by_name
+        },
+        "is_partial": bool(is_partial),
+    }
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--agent_model_names", type=str, required=True, help="2つ以上のモデル名をカンマ区切りで")
@@ -535,6 +602,29 @@ def main() -> None:
     p.add_argument("--ref_idx", type=int, default=0, help="hub空間として使う参照モデルのindex")
     p.add_argument("--ridge", type=float, default=1e-3)
 
+    p.add_argument(
+        "--save_per_model",
+        type=int,
+        default=1,
+        help="1: 1モデルの学習が終わるたびに進捗チェックポイント(.partial)を保存する。0: 無効。",
+    )
+    p.add_argument(
+        "--partial_ckpt_path",
+        type=str,
+        default="",
+        help="進捗チェックポイントの保存先。未指定なら <codec_path>.partial.<ext> を自動使用。",
+    )
+    p.add_argument(
+        "--resume_from_partial",
+        type=str,
+        default="",
+        help=(
+            "指定した.partialチェックポイントから再開する。"
+            "既に学習済みのモデル (--agent_model_names のうちckpt内に存在するもの) は"
+            "再学習をスキップし、まだ学習していないモデルだけ学習する。"
+        ),
+    )
+
     args = p.parse_args()
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -548,11 +638,40 @@ def main() -> None:
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+    partial_ckpt_path = ""
+    if int(args.save_per_model) == 1:
+        partial_ckpt_path = (args.partial_ckpt_path or "").strip() or _derive_partial_ckpt_path(args.codec_path)
+        print(f"Progressive checkpoint path: {partial_ckpt_path}")
+
     encoders: Dict[str, Dict[str, torch.Tensor]] = {}
     decoders: Dict[str, Dict[str, torch.Tensor]] = {}
     slot_by_name: Dict[str, WormholeSlot] = {}
 
+    # --- 途中経過チェックポイントからの再開 ---
+    if args.resume_from_partial:
+        if not os.path.exists(args.resume_from_partial):
+            raise FileNotFoundError(f"--resume_from_partial に指定されたファイルが見つかりません: {args.resume_from_partial}")
+        prev = torch.load(args.resume_from_partial, map_location="cpu")
+        prev_models = set(prev.get("models", []))
+        for name in model_names:
+            if name in prev_models and name in prev.get("encoders", {}) and name in prev.get("decoders", {}):
+                encoders[name] = prev["encoders"][name]
+                decoders[name] = prev["decoders"][name]
+                pc = prev.get("placeholder", {}).get(name, {})
+                if "token_id" in pc:
+                    slot_by_name[name] = WormholeSlot(
+                        token_id=int(pc["token_id"]),
+                        n_tokens=int(pc.get("n_tokens", args.codec_slot_tokens)),
+                    )
+                print(f"[resume] {name}: 学習済みチェックポイントを再利用し、再学習をスキップします。")
+        skipped = [n for n in model_names if n in encoders]
+        remaining = [n for n in model_names if n not in encoders]
+        print(f"[resume] スキップ: {skipped or 'なし'} / これから学習: {remaining or 'なし'}")
+
     for name in model_names:
+        if name in encoders and name in decoders:
+            continue  # resumeで既に読み込み済み
+
         print(f"\n===== Training wormhole codec for {name} =====")
         wrapper = ModelWrapper(name, device, use_vllm=False, args=args)
         token_id = _pick_placeholder_token_id(wrapper.tokenizer)
@@ -567,6 +686,25 @@ def main() -> None:
         del wrapper
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+        # --- このモデルまでの進捗を保存 (次に途中で落ちても再学習不要にする) ---
+        if partial_ckpt_path:
+            done_models = [n for n in model_names if n in encoders and n in decoders]
+            partial_align = _identity_alignment(done_models, codec_dim=int(args.codec_dim), ref_idx=0)
+            partial_ckpt = _build_checkpoint_dict(
+                model_names=done_models,
+                args=args,
+                encoders=encoders,
+                decoders=decoders,
+                slot_by_name=slot_by_name,
+                align=partial_align,
+                is_partial=True,
+            )
+            _atomic_torch_save(partial_ckpt, partial_ckpt_path)
+            print(
+                f"[checkpoint] 進捗を保存しました ({len(done_models)}/{len(model_names)} モデル完了): "
+                f"{partial_ckpt_path}"
+            )
 
     # --- hub空間へのridge alignment (2体なら片方をrefにするだけで十分だが、
     #     N体への拡張性のため元のvision版と同じロジックを流用) ---
@@ -591,29 +729,17 @@ def main() -> None:
         out_map[name] = {"W": W_out, "b": b_out}
         in_map[name] = {"W": W_in, "b": b_in}
 
-    ckpt = {
-        "version": 1,
-        "models": model_names,
-        "ref_model_name": ref_name,
-        "config": {
-            "codec_dim": int(args.codec_dim),
-            "codec_tokens": int(args.codec_tokens),
-            "codec_slot_tokens": int(args.codec_slot_tokens),
-            "codec_heads": int(args.codec_heads),
-            "codec_layers": int(args.codec_layers),
-            "codec_dropout": float(args.codec_dropout),
-            "codec_gate_init_bias": float(args.codec_gate_init_bias),
-        },
-        "encoders": encoders,
-        "decoders": decoders,
-        "align": {"ref_idx": ref_idx, "ref_model_name": ref_name, "out": out_map, "in": in_map},
-        "placeholder": {
-            name: {"token_id": slot_by_name[name].token_id, "n_tokens": slot_by_name[name].n_tokens}
-            for name in model_names
-        },
-    }
-    os.makedirs(os.path.dirname(args.codec_path) or ".", exist_ok=True)
-    torch.save(ckpt, args.codec_path)
+    final_align = {"ref_idx": ref_idx, "ref_model_name": ref_name, "out": out_map, "in": in_map}
+    ckpt = _build_checkpoint_dict(
+        model_names=model_names,
+        args=args,
+        encoders=encoders,
+        decoders=decoders,
+        slot_by_name=slot_by_name,
+        align=final_align,
+        is_partial=False,
+    )
+    _atomic_torch_save(ckpt, args.codec_path)
     print(f"\nSaved LLM wormhole codec checkpoint to: {args.codec_path}")
 
 
