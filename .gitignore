@@ -27,4 +27,8 @@ scripts/squash*
 checkpoints/
 run.py.bak
 runs/
-
+logs/
+data/
+debug_injection_stats.py
+debug_sender_latent.py
+scripts/build_anchor_texts.py
