@@ -40,12 +40,21 @@ from train_llm_wormhole import (
 )
 
 
-SENDER_PROMPT_TEMPLATE = """You are a Planner Agent. Given an input question, think through how to solve it.
+import os
+
+_TRAIN_STYLE_SENDER_PROMPT = os.environ.get("WORMHOLE_TRAIN_STYLE_SENDER", "0") == "1"
+
+_SENDER_PROMPT_TEMPLATE_PLANNER = """You are a Planner Agent. Given an input question, think through how to solve it.
 
 Question: {question}
 
 Do not produce the final answer. Just think through the problem.
 """
+
+_SENDER_PROMPT_TEMPLATE_TRAIN = "Message:\n{question}\n\nAcknowledge."
+
+SENDER_PROMPT_TEMPLATE = _SENDER_PROMPT_TEMPLATE_TRAIN if _TRAIN_STYLE_SENDER_PROMPT else _SENDER_PROMPT_TEMPLATE_PLANNER
+
 
 RECEIVER_PROMPT_TEMPLATE_PREFIX = """You are a helpful assistant. You are given latent information from another agent's reasoning process, provided below as a sequence of special tokens, followed by a target question.
 
