@@ -32,3 +32,6 @@ data/
 debug_injection_stats.py
 debug_sender_latent.py
 scripts/build_anchor_texts.py
+debug_alignment_quality.py
+fix_alignment_and_save.py
+recompute_alignment.py

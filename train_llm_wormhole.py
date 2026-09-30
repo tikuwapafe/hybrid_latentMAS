@@ -198,11 +198,10 @@ def _extract_dummy_text_tokens(wrapper: ModelWrapper, slot: WormholeSlot) -> tor
 def _build_receiver_prompt_ids(
     wrapper: ModelWrapper,
     slot: WormholeSlot,
-    question: str,
 ) -> Tuple[List[int], List[int]]:
     messages_prefix = [
         {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": RECEIVER_PROMPT_TEMPLATE_PREFIX},
+        {"role": "user", "content": "Message:\n"},
     ]
     tpl = getattr(wrapper.tokenizer, "chat_template", None)
     if tpl:
@@ -210,15 +209,11 @@ def _build_receiver_prompt_ids(
             messages_prefix, tokenize=False, add_generation_prompt=False
         )
     else:
-        prefix_text = (
-            f"<|system|>\nYou are a helpful assistant.\n</|system|>\n"
-            f"<|user|>\n{RECEIVER_PROMPT_TEMPLATE_PREFIX}"
-        )
+        prefix_text = "<|system|>\nYou are a helpful assistant.\n</|system|>\n<|user|>\nMessage:\n"
 
-    suffix_body = RECEIVER_PROMPT_TEMPLATE_SUFFIX.format(question=question)
     messages_full = [
         {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": RECEIVER_PROMPT_TEMPLATE_PREFIX + suffix_body},
+        {"role": "user", "content": "Message:\n\n\nAcknowledge."},
     ]
     if tpl:
         full_no_gen = wrapper.tokenizer.apply_chat_template(
@@ -230,7 +225,7 @@ def _build_receiver_prompt_ids(
         gen_prompt_suffix = full_with_gen[len(full_no_gen):]
     else:
         gen_prompt_suffix = "\n<|assistant|>"
-    suffix_text = suffix_body + gen_prompt_suffix
+    suffix_text = "\n\nAcknowledge." + gen_prompt_suffix
 
     prefix_ids = wrapper.tokenizer(prefix_text, add_special_tokens=False)["input_ids"]
     suffix_ids = wrapper.tokenizer(suffix_text, add_special_tokens=False)["input_ids"]
@@ -247,27 +242,8 @@ def _build_teacher_messages(text: str) -> List[Dict[str, str]]:
     """
     return [
         {"role": "system", "content": "You are a helpful assistant."},
-        {
-            "role": "user",
-            "content": (
-                f"Target Question: {text}\n\n"
-                "Reason step by step and give your final answer clearly at the end."
-            ),
-        },
+        {"role": "user", "content": f"Message:\n{text}\n\nAcknowledge."},
     ]
-
-RECEIVER_PROMPT_TEMPLATE_PREFIX = """You are a helpful assistant. You are given latent information from another agent's reasoning process, provided below as a sequence of special tokens, followed by a target question.
-
-Latent information:
-"""
-
-RECEIVER_PROMPT_TEMPLATE_SUFFIX = """
-
-Target Question: {question}
-
-The latent information might contain irrelevant contents; ignore it if unhelpful.
-Reason step by step and give your final answer clearly at the end.
-"""
 
 
 # =============================================================================
@@ -315,9 +291,9 @@ def _train_one_model(
     dummy_tokens = _extract_dummy_text_tokens(wrapper, slot)  # [n_tokens, H]
     dummy_rms = dummy_tokens.pow(2).mean().sqrt().clamp_min(1e-6)
 
-    emb_layer = wrapper.model.get_input_embeddings()
-    # recv_ids, recv_pos = _build_receiver_prompt_ids(wrapper, slot)
-    # recv_ids_t = torch.tensor(recv_ids, dtype=torch.long, device=device)
+    # emb_layer = wrapper.model.get_input_embeddings()
+    recv_ids, recv_pos = _build_receiver_prompt_ids(wrapper, slot)
+    recv_ids_t = torch.tensor(recv_ids, dtype=torch.long, device=device)
 
     pbar = tqdm(range(int(cfg.steps)), desc=f"[llm-wormhole] {wrapper.model_name}")
     for step in pbar:
@@ -364,32 +340,13 @@ def _train_one_model(
         if cfg.inj_clip > 0:
             inj = inj.clamp(min=-cfg.inj_clip, max=cfg.inj_clip)
 
-        # --- 受信側: dummy文章枠に注入して1回のforward (質問ごとにsuffixが変わるためpadding) ---
-        recv_ids_list = []
-        recv_pos = None
-        for t in batch_texts:
-            ids, pos = _build_receiver_prompt_ids(wrapper, slot, question=t)
-            recv_ids_list.append(ids)
-            if recv_pos is None:
-                recv_pos = pos  # プレースホルダ位置はprefix長のみで決まるため質問に依らず固定
-
-        max_len = max(len(x) for x in recv_ids_list)
-        pad_id = wrapper.tokenizer.pad_token_id
-        if pad_id is None:
-            pad_id = wrapper.tokenizer.eos_token_id
-        recv_ids_padded = torch.full((B, max_len), int(pad_id), dtype=torch.long, device=device)
-        attn_s = torch.zeros((B, max_len), dtype=teacher_mask.dtype, device=device)
-        last_pos_s = torch.zeros((B,), dtype=torch.long, device=device)
-        for i, ids in enumerate(recv_ids_list):
-            L = len(ids)
-            recv_ids_padded[i, :L] = torch.tensor(ids, dtype=torch.long, device=device)
-            attn_s[i, :L] = 1
-            last_pos_s[i] = L - 1
-
-        base_embeds = emb_layer(recv_ids_padded).detach()
+        # --- 受信側: dummy文章枠に注入して1回のforward ---
+        recv_ids_b = recv_ids_t.unsqueeze(0).expand(B, -1)
+        base_embeds = emb_layer(recv_ids_b).detach()
         inputs_embeds = base_embeds.clone()
         add = _resample_tokens(inj, len(recv_pos))
         inputs_embeds[:, recv_pos, :] = base_embeds[:, recv_pos, :] + add.to(base_embeds.dtype)
+        attn_s = torch.ones_like(recv_ids_b, dtype=teacher_mask.dtype)
 
         out_s = wrapper.model(
             inputs_embeds=inputs_embeds,
@@ -399,8 +356,8 @@ def _train_one_model(
             return_dict=True,
         )
         hs_s = _get_hidden_states_tuple(out_s)
-        student_h = hs_s[-1][torch.arange(B, device=device), last_pos_s, :]
-        student_logits = out_s.logits[torch.arange(B, device=device), last_pos_s, :]
+        student_h = hs_s[-1][:, -1, :]
+        student_logits = out_s.logits[:, -1, :]
 
         teacher_h = torch.nan_to_num(teacher_h.float(), nan=0.0, posinf=1e4, neginf=-1e4)
         student_h = torch.nan_to_num(student_h.float(), nan=0.0, posinf=1e4, neginf=-1e4)
